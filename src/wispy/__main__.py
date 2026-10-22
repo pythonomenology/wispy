@@ -53,14 +53,6 @@ def _build_registry(
     layer) surfaces as a duplicate-registration config error rather
     than silently overriding the built-ins.
 
-    ``initialize`` returns the JSON-serialisable form of
-    :class:`~wispy.endpoints.Capabilities` rather than the dataclass
-    itself: the dispatcher hands the return value straight to the
-    JSON-RPC serializer (which only knows how to encode primitives),
-    while the lifecycle FSM merely caches the value opaquely. The
-    dispatcher logs a benign warning that the result is not a
-    :class:`Capabilities` instance; that is acceptable here since the
-    cache value is never inspected for shape elsewhere in the runtime.
     """
     registry = HandlerRegistry()
 
@@ -68,7 +60,7 @@ def _build_registry(
         return Capabilities(
             methods=tuple(registry.methods()),
             protocol_version=PROTOCOL_VERSION,
-        ).to_jsonable()
+        )
 
     def _shutdown(_params: Any) -> None:
         return None

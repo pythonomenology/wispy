@@ -73,12 +73,14 @@ if __name__ == "__main__":
 A few things worth noting:
 
 - Handlers receive the request `params` value as a single argument and
-  return a JSON-serializable result. They can be either `def` or
+  return a JSON-serializable result. The wire data models
+  (`Capabilities`, `Environment`, `ExecuteResult`, `DeleteAck`) may be
+  returned directly; they are encoded through their `to_jsonable()`. They can be either `def` or
   `async def`; sync handlers run on the default executor so they don't
   block the event loop.
 - `registry.methods()` is what you should advertise from `initialize`.
-  `wispy.Capabilities.to_jsonable()` produces a plain dict that the
-  dispatcher hands directly to `json.dumps`.
+  Return `wispy.Capabilities(...)` or its `to_jsonable()` dict; either
+  way the lifecycle FSM caches it as `Capabilities`.
 - A second `initialize` will be rejected by the lifecycle FSM with
   `-32600`; the cached capabilities from the first successful call are
   preserved verbatim.

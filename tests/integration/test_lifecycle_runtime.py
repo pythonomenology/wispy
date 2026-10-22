@@ -39,12 +39,9 @@ _NO_FDS: list[int] = []
 # Driver script run by ``python -c``. Registers ``initialize`` and
 # ``shutdown`` handlers and drives ``run_stdio`` until the child exits.
 #
-# The ``initialize`` handler returns the JSON-serialisable ``dict`` form
-# of :class:`~wispy.endpoints.Capabilities`. The lifecycle manager only
-# requires *something* to cache; the dispatcher's response codec needs a
-# JSON-friendly value, which a dataclass instance is not. The driver
-# emits a benign ``warning: initialize handler did not return
-# Capabilities`` line to stderr, which the test ignores.
+# The ``initialize`` handler returns the ``to_jsonable()`` dict form of
+# :class:`~wispy.endpoints.Capabilities`; the dispatcher accepts either
+# that or the dataclass itself.
 _DRIVER_SCRIPT = """
 import asyncio
 import sys

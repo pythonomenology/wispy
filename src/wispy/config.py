@@ -36,6 +36,9 @@ The schema is intentionally narrow:
   Each WSP method has a sensible default mode so most callers do not
   need to specify ``result`` explicitly. See :data:`_DEFAULT_RESULT_MODE`.
 
+* Subprocess entries may also carry a ``timeout``: the wall-clock limit,
+  in seconds, for one run of the command (default 30).
+
 * Any other key inside a handler entry is rejected.
 
 All rejection paths raise :class:`ConfigError` with a message that
@@ -55,10 +58,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import importlib
 import json
 import shutil
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -76,9 +81,9 @@ else:  # pragma: no cover - exercised only on 3.10
 from wispy.endpoints import WSP_METHODS
 from wispy.errors import WspError, WspErrorCode
 
-# Subprocess_Handler invocations have a 30-second wall-clock timeout
-# that is independent of the dispatcher's per-request timeout.
-# Exceeding it is mapped to ``EXECUTION_FAILED``.
+# Default wall-clock timeout for one Subprocess_Handler invocation,
+# overridable per entry with ``timeout``. Exceeding it is mapped to
+# ``EXECUTION_FAILED``.
 _SUBPROCESS_TIMEOUT = 30.0
 
 # A handler entry that names both ``import`` and ``command`` has both
@@ -119,6 +124,7 @@ __all__ = [
     "PythonHandlerSpec",
     "ResultMode",
     "SubprocessHandlerSpec",
+    "configured_timeout",
     "load_config",
     "make_handler",
 ]
@@ -152,11 +158,14 @@ class SubprocessHandlerSpec:
             :data:`ResultMode.TEMPLATE`; a JSON-like value (dict, list,
             or scalar) whose strings are rendered with the same
             ``{key}`` substitution as ``argv_template``.
+        timeout: Wall-clock limit, in seconds, for one run of the
+            command.
     """
 
     argv_template: tuple[str, ...]
     result_mode: ResultMode
     result_template: Any = None
+    timeout: float = _SUBPROCESS_TIMEOUT
 
 
 @dataclass(frozen=True)
@@ -187,6 +196,48 @@ def load_config(path: Path) -> list[ConfigEntry]:
     :data:`~wispy.endpoints.WSP_METHODS` so a typo surfaces here
     rather than at first request.
     """
+    doc = _read_document(path)
+
+    handlers = doc.get("handlers", {})
+    if not isinstance(handlers, dict):
+        msg = "'handlers' must be a table/object"
+        raise ConfigError(msg)
+
+    entries: list[ConfigEntry] = []
+    for method, spec_obj in handlers.items():
+        if method not in WSP_METHODS:
+            msg = f"unknown WSP method {method!r}"
+            raise ConfigError(msg)
+        if not isinstance(spec_obj, dict):
+            msg = f"handler entry for {method!r} must be a table/object"
+            raise ConfigError(msg)
+        entries.append(_load_entry(method, spec_obj))
+
+    return entries
+
+
+def configured_timeout(path: Path, method: str) -> float | None:
+    """Return the ``timeout`` the Config_File at ``path`` sets for ``method``.
+
+    Returns ``None`` when the file cannot be read, ``method`` has no
+    entry, or the entry sets no valid ``timeout``. Unlike
+    :func:`load_config` this neither validates the rest of the file nor
+    imports ``import`` handlers, so the WSP_CLI can size its own
+    response timeout without running the user's code; the child server
+    still validates the file in full.
+    """
+    try:
+        doc = _read_document(path)
+    except ConfigError:
+        return None
+    handlers = doc.get("handlers")
+    entry = handlers.get(method) if isinstance(handlers, dict) else None
+    timeout = entry.get("timeout") if isinstance(entry, dict) else None
+    return float(timeout) if _is_valid_timeout(timeout) else None
+
+
+def _read_document(path: Path) -> dict[str, Any]:
+    """Parse ``path`` as TOML or JSON by extension; the top level must be a table."""
     suffix = path.suffix.lower()
     if suffix == ".toml":
         try:
@@ -215,23 +266,12 @@ def load_config(path: Path) -> list[ConfigEntry]:
     if not isinstance(doc, dict):
         msg = "top-level config must be a table/object"
         raise ConfigError(msg)
+    return doc
 
-    handlers = doc.get("handlers", {})
-    if not isinstance(handlers, dict):
-        msg = "'handlers' must be a table/object"
-        raise ConfigError(msg)
 
-    entries: list[ConfigEntry] = []
-    for method, spec_obj in handlers.items():
-        if method not in WSP_METHODS:
-            msg = f"unknown WSP method {method!r}"
-            raise ConfigError(msg)
-        if not isinstance(spec_obj, dict):
-            msg = f"handler entry for {method!r} must be a table/object"
-            raise ConfigError(msg)
-        entries.append(_load_entry(method, spec_obj))
-
-    return entries
+def _is_valid_timeout(value: Any) -> bool:
+    """``True`` iff ``value`` is a positive number (and not a bool)."""
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and value > 0
 
 
 def _load_entry(method: str, spec_obj: dict[str, Any]) -> ConfigEntry:
@@ -290,9 +330,10 @@ def _load_subprocess_spec(method: str, spec_obj: dict[str, Any]) -> SubprocessHa
     """Validate the ``command``-shaped handler entry shape.
 
     Accepts the keys ``command`` (required), ``result`` (optional),
-    and ``template`` (required when ``result == "template"``).
+    ``template`` (required when ``result == "template"``), and
+    ``timeout`` (optional, a positive number of seconds).
     """
-    allowed = {"command", "result", "template"}
+    allowed = {"command", "result", "template", "timeout"}
     unknown = set(spec_obj.keys()) - allowed
     if unknown:
         msg = f"handler entry for {method!r} has unknown keys: {sorted(unknown)!r}"
@@ -336,10 +377,16 @@ def _load_subprocess_spec(method: str, spec_obj: dict[str, Any]) -> SubprocessHa
         )
         raise ConfigError(msg)
 
+    timeout = spec_obj.get("timeout", _SUBPROCESS_TIMEOUT)
+    if not _is_valid_timeout(timeout):
+        msg = f"handler entry for {method!r}: 'timeout' must be a positive number of seconds"
+        raise ConfigError(msg)
+
     return SubprocessHandlerSpec(
         argv_template=tuple(command),
         result_mode=result_mode,
         result_template=template,
+        timeout=float(timeout),
     )
 
 
@@ -490,6 +537,31 @@ def _render_string(template: str, params: Any) -> str:
     return "".join(chunks)
 
 
+def _params_as_json(params: Any) -> Any:
+    """Return ``params`` in its JSON wire shape for template rendering.
+
+    For WSP methods the dispatcher hands handlers a normalized params
+    dataclass (e.g. :class:`~wispy.endpoints.ExecuteParams`), but
+    templates address params by their wire names. Convert the dataclass
+    back to a dict, turning tuples into lists (so ``{argv}`` splats) and
+    omitting unset optional fields (so a reference to one reports
+    "missing"). Any other value is returned unchanged.
+    """
+    if not dataclasses.is_dataclass(params) or isinstance(params, type):
+        return params
+    out: dict[str, Any] = {}
+    for f in dataclasses.fields(params):
+        value = getattr(params, f.name)
+        if value is None:
+            continue
+        if isinstance(value, tuple):
+            value = list(value)
+        elif isinstance(value, Mapping):
+            value = dict(value)
+        out[f.name] = value
+    return out
+
+
 def _lookup_param(params: Any, key: str) -> Any:
     """Look up ``key`` in ``params`` (a dict)."""
     if not isinstance(params, dict):
@@ -532,12 +604,14 @@ class _Outcome:
     argv: list[str] = field(default_factory=list)
 
 
-async def _spawn_and_capture(argv: list[str]) -> _Outcome:
+async def _spawn_and_capture(argv: list[str], timeout: float = _SUBPROCESS_TIMEOUT) -> _Outcome:
     """Spawn ``argv``, close stdin, and capture stdout/stderr.
 
     Raises :class:`WspError` on any of: spawn failure, timeout. The
     caller decides whether a non-zero return code is itself a failure
-    (it is for every result mode wispy currently supports).
+    (it is for every result mode wispy currently supports). If the
+    calling task is cancelled (e.g. by the runtime's drain timeout),
+    the child is killed rather than left running.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -564,8 +638,16 @@ async def _spawn_and_capture(argv: list[str]) -> _Outcome:
     try:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(),
-            timeout=_SUBPROCESS_TIMEOUT,
+            timeout=timeout,
         )
+    except asyncio.CancelledError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        # Reap the child so its transport and pipes are closed rather
+        # than leaked until the loop closes.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        raise
     except asyncio.TimeoutError as exc:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
@@ -573,7 +655,7 @@ async def _spawn_and_capture(argv: list[str]) -> _Outcome:
             _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=2.0)
         except Exception:  # noqa: BLE001 - teardown after timeout must be robust
             stderr = b""
-        msg = f"subprocess handler timed out after {_SUBPROCESS_TIMEOUT}s"
+        msg = f"subprocess handler timed out after {timeout:g}s"
         raise WspError(
             int(WspErrorCode.EXECUTION_FAILED),
             msg,
@@ -603,8 +685,10 @@ def _make_subprocess_handler(spec: SubprocessHandlerSpec) -> Handler:
     template = spec.argv_template
     mode = spec.result_mode
     result_template = spec.result_template
+    timeout = spec.timeout
 
     async def handler(params: Any) -> Any:
+        params = _params_as_json(params)
         try:
             argv = _render_argv(template, params)
         except _SubstitutionError as exc:
@@ -614,7 +698,7 @@ def _make_subprocess_handler(spec: SubprocessHandlerSpec) -> Handler:
                 data={"reason": exc.reason},
             ) from exc
 
-        outcome = await _spawn_and_capture(argv)
+        outcome = await _spawn_and_capture(argv, timeout)
 
         if mode is ResultMode.EXEC:
             # The result IS the captured outcome; non-zero exit codes

@@ -9,10 +9,17 @@ exit code based on the response.
 
 `wsp` runs in one of three modes, picked by the top-level flags:
 
-- **`--tool ARGV...`** — launches the supplied argv as the WSP server and
-  routes the call through it. Use this when you have a workflow tool that
-  knows how to run as a WSP server (because it embedded `wispy` directly,
-  or because it implements WSP itself).
+- **`--tool ARGV... METHOD`** — launches the supplied argv as the WSP
+  server and routes the call through it, e.g.
+  `wsp --tool my-tool wsp-serve environment/list`. The server argv ends
+  at the first argument that names a method subcommand. Use this when
+  you have a workflow tool that knows how to run as a WSP server
+  (because it embedded `wispy` directly, or because it implements WSP
+  itself).
+
+  If the server fails before answering (for example a `--config` child
+  rejecting its Config_File), its stderr is echoed after `wsp`'s own
+  error message.
 - **`--config PATH`** — launches `python -m wispy --config PATH` as the
   WSP server. Use this with the [Config_File flow](config-file.md).
 - **No flag** — runs the built-in fallback workflow tool in-process. Use
@@ -76,10 +83,12 @@ See [Exit codes](../reference/exit-codes.md) for the rationale.
 `wsp` enforces two 30-second budgets per invocation:
 
 - **Launch:** the child server has 30 seconds to start.
-- **Per-call:** each request has 30 seconds to receive a response.
+- **Per-call:** each request has 30 seconds to receive a response. In
+  `--config` mode, when the Config_File gives the requested method a
+  longer `timeout`, `wsp` waits that long plus five seconds instead.
 
 Exceeding either prints a one-line error to stderr and exits with status
-`1`.
+`1`. Responses are not size-limited.
 
 ## Termination
 
@@ -127,8 +136,14 @@ wsp --config my-tool.toml environment/list
 
 ### Executing a command in an environment
 
-The `--argv` field is an array of strings, so use `--params-json -` to
-pass it:
+`--argv` takes every remaining argument as the command, so it must be
+the last flag. `--env KEY=VALUE` may be repeated:
+
+```sh
+wsp environment/execute --id env-1f0eafbb96d3 --env PYTHONWARNINGS=error --argv python -V
+```
+
+The same request as JSON:
 
 ```sh
 echo '{"id": "env-1f0eafbb96d3", "argv": ["python", "-V"]}' \

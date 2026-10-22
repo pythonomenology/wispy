@@ -220,3 +220,6 @@ __marimo__/
 # AI 
 .kiro
 .claude
+
+# Lean build output for the formal models
+lean/.lake/

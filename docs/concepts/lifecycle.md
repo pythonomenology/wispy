@@ -78,6 +78,15 @@ The process exit status depends on whether `shutdown` ran first:
 - `exit` after a successful `shutdown` → exit status `0`.
 - `exit` from any other state → exit status `1`.
 
+## Pipelined requests
+
+A client may write several messages without waiting for replies. Each
+message is accepted or rejected according to the state the server was in
+when it read that message, not when its handler gets to run. A request
+sent before `shutdown` or `exit` is still handled, and its response is
+written before the server exits, as long as it finishes within the
+five-second drain described below.
+
 ## EOF drain
 
 Closing stdin is also a clean way to end a session. The runtime waits up to

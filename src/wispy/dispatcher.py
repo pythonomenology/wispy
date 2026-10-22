@@ -259,15 +259,17 @@ async def _dispatch_single(
     # ----- Lifecycle edge transitions on success --------------------- #
     if request.method == "initialize":
         try:
-            # The dispatcher trusts the handler to return Capabilities;
-            # if it doesn't, log a warning but still cache the value so
+            # Handlers may return Capabilities or its documented
+            # ``to_jsonable()`` dict; either way the FSM caches a real
+            # Capabilities. Anything else is logged but still cached so
             # downstream observers see a consistent FSM transition.
-            if not isinstance(result, Capabilities):
+            caps = _as_capabilities(result)
+            if caps is None:
                 _safe_log(
                     log,
                     f"warning: initialize handler did not return Capabilities (got {type(result).__name__})",
                 )
-            lifecycle.on_initialize_success(result)
+            lifecycle.on_initialize_success(caps if caps is not None else result)
         except Exception:  # noqa: BLE001 - lifecycle edge must not abort
             _safe_log(log, traceback.format_exc())
     elif request.method == "shutdown":
@@ -354,20 +356,38 @@ async def _dispatch_batch(
 async def _invoke_handler(handler: Callable[..., Any], params: Any) -> Any:
     """Invoke ``handler`` with ``params`` and return its (awaited) result.
 
-    Async handlers (detected by :func:`inspect.iscoroutinefunction` or
-    :func:`asyncio.iscoroutinefunction`) are awaited directly. Sync
-    handlers are off-loaded to the default executor so they cannot
-    block the event loop. As a final accommodation, if the executor's
-    return value happens to be awaitable (e.g. a sync wrapper that
-    returns a coroutine), it is awaited too.
+    Async handlers (detected by :func:`inspect.iscoroutinefunction`)
+    are awaited directly. Sync handlers are off-loaded to the default
+    executor so they cannot block the event loop. As a final
+    accommodation, if the executor's return value happens to be
+    awaitable (e.g. a sync wrapper that returns a coroutine), it is
+    awaited too.
+
+    ``asyncio.iscoroutinefunction`` is deliberately not consulted: it
+    is deprecated since Python 3.14 and warns on every call.
     """
-    if inspect.iscoroutinefunction(handler) or asyncio.iscoroutinefunction(handler):
+    if inspect.iscoroutinefunction(handler):
         return await handler(params)
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, handler, params)
     if inspect.isawaitable(result):
         result = await result
     return result
+
+
+def _as_capabilities(result: Any) -> Capabilities | None:
+    """Return ``result`` as :class:`Capabilities`, or ``None`` if it is not one.
+
+    Accepts the dataclass itself or its ``to_jsonable()`` dict form.
+    """
+    if isinstance(result, Capabilities):
+        return result
+    if isinstance(result, dict):
+        try:
+            return Capabilities.from_jsonable(result)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 # --------------------------------------------------------------------- #

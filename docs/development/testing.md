@@ -115,3 +115,30 @@ model, the environment endpoint validators — have universal claims that
 adversarial inputs across the same input space and shrinks failures
 into minimal counterexamples, which is exactly the right tool for
 verifying a protocol implementation.
+
+## Formal models
+
+Three hand-written models sit beside the tests. TLA+ specs live in
+`tla/` and are checked by the TLC model checker, which tries every
+ordering of the modelled steps at small sizes. The Lean 4 model lives
+in `lean/` and is a proof for every input size. Each model's header
+comment names the source lines it follows and its assumptions. Each
+`.mutations` file lists the deliberate bugs its checks must catch.
+
+| Model | What it checks | Boundary configuration |
+| --- | --- | --- |
+| `tla/ServerAdmission` | `run_stdio` admits each message against the lifecycle state at the time it was read; every request that is not cancelled gets exactly one response; nothing is written after return; the exit status is 0 only when `shutdown` preceded `exit`; `run_stdio` returns after EOF or `exit`. | `reqexit shipped`: `initialize, req, exit` in one stdin chunk with the built-in sync handlers. |
+| `tla/FallbackStore` | Concurrent `environment/*` calls never lose an index update or duplicate a name or id; a crash never leaves `index.json` torn; every listed env has a complete venv, even after a crash or failed removal; `execute` and `get` keep their env until they finish; leftover directories from a crash or failed removal are gone after the next create or delete. They are not prevented. | `EX h=2 pre=1`: one `execute` and one `delete` of the same env. `OD h=1 faults=crash`: a create killed mid-build leaves a directory until the next sweep. |
+| `lean/Model/FrameDecoder` | Every valid frame round-trips; any chunking yields the same payloads; an oversized frame is skipped by exactly its length; the garbage discard keeps 3 bytes so a split terminator is still found; every step shrinks the buffer. | Header blocks of at most 8,193 bytes; longer ones make the output depend on chunk boundaries. |
+
+Recheck with the `agent-formal-verify` plugin's helpers, where
+`<skill-dir>` is its installed `formal-verify` skill directory:
+
+```sh
+bash <skill-dir>/scripts/tlc-matrix.sh "$PWD/tla/ServerAdmission.matrix"
+bash <skill-dir>/scripts/tlc-matrix.sh "$PWD/tla/FallbackStore.matrix"
+bash <skill-dir>/scripts/lean-check.sh "$PWD/lean"
+python3 <skill-dir>/scripts/mutate.py "$PWD/tla/ServerAdmission.mutations"
+python3 <skill-dir>/scripts/mutate.py "$PWD/tla/FallbackStore.mutations"
+python3 <skill-dir>/scripts/mutate.py "$PWD/lean/Model/FrameDecoder.mutations"
+```

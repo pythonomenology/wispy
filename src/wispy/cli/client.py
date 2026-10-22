@@ -21,10 +21,23 @@ up to 10 seconds for the child to terminate, and falls back to
 Timeouts:
 
 * Launch:    30 seconds (``asyncio.create_subprocess_exec``)
-* Per-call:  30 seconds per JSON-RPC response read
+* Per-call:  30 seconds per JSON-RPC response read, except that the
+  requested method's response may be given longer via
+  ``response_timeout`` (the CLI does so for a Config_File entry with a
+  longer ``timeout``)
 
 Exceeding either prints a human-readable error to stderr and surfaces
 the generic-error exit code (1).
+
+The child's stderr is drained continuously (an unread pipe fills up
+and blocks a chatty server mid-write). Only a bounded tail is kept; it
+is echoed to the user's stderr when the call fails at the transport
+level (timeout, closed stdout, or a write to a child that already
+exited), e.g. when a ``--config`` child rejects its Config_File and
+exits before answering.
+
+Responses are not size-capped: the child is the server the user chose
+to run, and a large ``environment/execute`` result is legitimate.
 
 Exit-code mapping:
 
@@ -72,6 +85,11 @@ _KILL_REAP_TIMEOUT_S: float = 2.0
 # in a single read; small enough to bound buffering on misbehaving
 # servers.
 _READ_CHUNK_SIZE: int = 65536
+# How much of the child's stderr to keep for diagnostics.
+_STDERR_TAIL_BYTES: int = 64 * 1024
+# After the child closes stdout, how long to let the stderr pump catch
+# up before echoing what it collected.
+_STDERR_SETTLE_S: float = 1.0
 
 
 class ClientResult:
@@ -127,20 +145,28 @@ class WspClient:
         "_decoder",
         "_exit_sent",
         "_next_id",
+        "_response_timeout",
         "_shutdown_sent",
+        "_stderr_tail",
+        "_stderr_task",
         "argv",
         "proc",
     )
 
-    def __init__(self, argv: list[str]) -> None:
+    def __init__(self, argv: list[str], *, response_timeout: float = _RESPONSE_TIMEOUT_S) -> None:
         # Defensive copy so callers cannot mutate our argv after
         # construction.
         self.argv: list[str] = list(argv)
         self.proc: asyncio.subprocess.Process | None = None
-        self._decoder: FrameDecoder = FrameDecoder()
+        # How long :meth:`call` waits for the requested method's
+        # response; lifecycle requests always use the default.
+        self._response_timeout = response_timeout
+        self._decoder: FrameDecoder = FrameDecoder(max_content_length=None)
         self._next_id: int = 1
         self._shutdown_sent: bool = False
         self._exit_sent: bool = False
+        self._stderr_tail: bytearray = bytearray()
+        self._stderr_task: asyncio.Task[None] | None = None
 
     # ---------------------------------------------------------------- #
     # Context-manager protocol.
@@ -163,6 +189,8 @@ class WspClient:
         except FileNotFoundError as exc:
             sys.stderr.write(f"wsp: failed to launch child process: {exc}\n")
             raise
+        if self.proc.stderr is not None:
+            self._stderr_task = asyncio.create_task(self._pump_stderr(self.proc.stderr))
         return self
 
     async def __aexit__(
@@ -210,6 +238,11 @@ class WspClient:
                     await asyncio.wait_for(proc.wait(), timeout=_KILL_REAP_TIMEOUT_S)
         finally:
             self.proc = None
+            task, self._stderr_task = self._stderr_task, None
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
 
     # ---------------------------------------------------------------- #
     # Public API.
@@ -234,34 +267,23 @@ class WspClient:
         sees a human-readable explanation.
         """
         # 1. initialize
-        try:
-            init_resp = await self._send_request(
-                "initialize",
-                {
-                    "client_name": "wsp-cli",
-                    "client_protocol_version": "0.1.0",
-                },
-            )
-        except asyncio.TimeoutError:
-            sys.stderr.write(f"wsp: response timeout after {_RESPONSE_TIMEOUT_S:g}s for initialize\n")
+        init_resp = await self._request_or_report(
+            "initialize",
+            {
+                "client_name": "wsp-cli",
+                "client_protocol_version": "0.1.0",
+            },
+            timeout=_RESPONSE_TIMEOUT_S,
+        )
+        if init_resp is None:
             return ClientResult(exit_code=ExitCode.GENERIC_ERROR)
-        except EOFError as exc:
-            sys.stderr.write(f"wsp: {exc}\n")
-            return ClientResult(exit_code=ExitCode.GENERIC_ERROR)
-
         if "error" in init_resp:
             return _result_from_error_response(init_resp)
 
         # 2. requested method
-        try:
-            method_resp = await self._send_request(method, params)
-        except asyncio.TimeoutError:
-            sys.stderr.write(f"wsp: response timeout after {_RESPONSE_TIMEOUT_S:g}s for {method}\n")
+        method_resp = await self._request_or_report(method, params, timeout=self._response_timeout)
+        if method_resp is None:
             return ClientResult(exit_code=ExitCode.GENERIC_ERROR)
-        except EOFError as exc:
-            sys.stderr.write(f"wsp: {exc}\n")
-            return ClientResult(exit_code=ExitCode.GENERIC_ERROR)
-
         if "error" in method_resp:
             return _result_from_error_response(method_resp)
 
@@ -274,11 +296,63 @@ class WspClient:
     # Internal helpers.
     # ---------------------------------------------------------------- #
 
-    async def _send_request(self, method: str, params: Any) -> dict[str, Any]:
+    async def _request_or_report(self, method: str, params: Any, *, timeout: float) -> dict[str, Any] | None:
+        """Send a request and return its response, or ``None`` on a transport failure.
+
+        A failure (no response within ``timeout``, the child closing
+        stdout, or the child having exited before reading the request)
+        is reported on stderr, followed by the child's own stderr.
+        """
+        try:
+            return await self._send_request(method, params, timeout=timeout)
+        except asyncio.TimeoutError:
+            sys.stderr.write(f"wsp: response timeout after {timeout:g}s for {method}\n")
+            await self._echo_child_stderr(settle=False)
+        except EOFError as exc:
+            sys.stderr.write(f"wsp: {exc}\n")
+            await self._echo_child_stderr(settle=True)
+        except ConnectionError as exc:
+            # BrokenPipeError / ConnectionResetError from writing to a
+            # child that has already exited.
+            sys.stderr.write(f"wsp: server exited before reading {method}: {exc}\n")
+            await self._echo_child_stderr(settle=True)
+        return None
+
+    async def _pump_stderr(self, stream: asyncio.StreamReader) -> None:
+        """Drain the child's stderr until EOF, keeping a bounded tail."""
+        while True:
+            chunk = await stream.read(_READ_CHUNK_SIZE)
+            if not chunk:
+                return
+            self._stderr_tail.extend(chunk)
+            if len(self._stderr_tail) > _STDERR_TAIL_BYTES:
+                del self._stderr_tail[:-_STDERR_TAIL_BYTES]
+
+    async def _echo_child_stderr(self, *, settle: bool) -> None:
+        """Write the child's captured stderr to our stderr.
+
+        With ``settle``, first give the pump a moment to collect the
+        last output of a child that is exiting.
+        """
+        task = self._stderr_task
+        if settle and task is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=_STDERR_SETTLE_S)
+        text = self._stderr_tail.decode("utf-8", errors="replace").rstrip()
+        if text:
+            sys.stderr.write(f"{text}\n")
+
+    async def _send_request(
+        self,
+        method: str,
+        params: Any,
+        *,
+        timeout: float = _RESPONSE_TIMEOUT_S,
+    ) -> dict[str, Any]:
         """Send a JSON-RPC request and return the matching response.
 
         Raises :class:`asyncio.TimeoutError` if no response with the
-        expected id arrives within :data:`_RESPONSE_TIMEOUT_S`, and
+        expected id arrives within ``timeout`` seconds, and
         :class:`EOFError` if the child closes stdout before
         responding.
         """
@@ -294,7 +368,7 @@ class WspClient:
         await self._write_frame(_encode_json(msg))
         if method == "shutdown":
             self._shutdown_sent = True
-        return await self._read_response_for_id(rid)
+        return await self._read_response_for_id(rid, timeout)
 
     async def _send_notification(self, method: str) -> None:
         """Send a JSON-RPC notification (no id, no response)."""
@@ -316,7 +390,7 @@ class WspClient:
         stdin.write(encode_frame(payload))
         await stdin.drain()
 
-    async def _read_response_for_id(self, expected_id: int) -> dict[str, Any]:
+    async def _read_response_for_id(self, expected_id: int, timeout: float) -> dict[str, Any]:
         """Read frames until we get a response with ``expected_id``.
 
         Server-initiated notifications (or responses to other ids) are
@@ -334,7 +408,7 @@ class WspClient:
             raise RuntimeError(msg)
 
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _RESPONSE_TIMEOUT_S
+        deadline = loop.time() + timeout
 
         while True:
             # First, drain anything the framing decoder already has

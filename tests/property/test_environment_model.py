@@ -26,9 +26,9 @@ machine asserts that:
 * a successful ``environment/execute`` result has an ``int`` exit code
   and ``str`` stdout/stderr.
 
-The cost of a real ``venv.EnvBuilder.create`` and of every
+The cost of a real venv creation and of every
 ``subprocess.run`` invocation would dominate this test by orders of
-magnitude. Both are imported at module scope in
+magnitude. Both are reachable at module scope in
 :mod:`wispy.cli.fallback` precisely so the test can replace them via
 :mod:`unittest.mock`; see the module docstring there for the contract.
 """
@@ -40,7 +40,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import venv
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -102,8 +101,8 @@ def _fake_subprocess_run(argv: Any, **_kwargs: Any) -> subprocess.CompletedProce
     return subprocess.CompletedProcess(args=argv, returncode=0, stdout=b"[]", stderr=b"")
 
 
-def _fake_envbuilder_create(_self: Any, _target_dir: Any) -> None:
-    """No-op stub for :meth:`venv.EnvBuilder.create`.
+def _fake_create_venv(_interpreter: Any, _target_dir: Any) -> None:
+    """No-op stub for :func:`wispy.cli.fallback._create_venv`.
 
     The fallback handler does not stat the venv after creation
     (``environment/get`` reconstructs ``interpreter_path`` purely from
@@ -185,10 +184,9 @@ class EnvironmentModelMachine(RuleBasedStateMachine):
                 "wispy.cli.fallback.subprocess.run",
                 side_effect=_fake_subprocess_run,
             ),
-            mock.patch.object(
-                venv.EnvBuilder,
-                "create",
-                _fake_envbuilder_create,
+            mock.patch(
+                "wispy.cli.fallback._create_venv",
+                _fake_create_venv,
             ),
             mock.patch(
                 "wispy.cli.fallback.shutil.which",

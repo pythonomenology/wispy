@@ -232,6 +232,13 @@ def parse_message(raw: bytes) -> JsonRpcRequest | list[JsonRpcRequest | ParseFai
             ParseFailureKind.PARSE_ERROR,
             f"message is not valid JSON: {exc.msg}",
         )
+    except RecursionError:
+        # ``json.loads`` recurses once per nesting level, so a payload
+        # like ``[[[[...`` exhausts the stack before it can be rejected.
+        return ParseFailure(
+            ParseFailureKind.PARSE_ERROR,
+            "message is nested too deeply",
+        )
 
     if isinstance(value, list):
         if not value:
@@ -256,6 +263,12 @@ def serialize_response(
     ``result``. For error responses, emits ``error: {code, message[,
     data]}`` and omits ``data`` when it is unset. Ids are serialized
     back to their original JSON type, including JSON null.
+
+    Objects exposing a ``to_jsonable()`` method (the wire data models in
+    :mod:`wispy.endpoints`) are converted through it, so handlers may
+    return :class:`~wispy.endpoints.Capabilities`,
+    :class:`~wispy.endpoints.Environment`, etc. directly. Any other
+    non-JSON value raises :class:`TypeError`.
     """
     if isinstance(resp, list):
         body: Any = [_response_to_jsonable(r) for r in resp]
@@ -266,6 +279,7 @@ def serialize_response(
         ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),
+        default=_json_default,
     ).encode("utf-8")
 
 
@@ -386,6 +400,15 @@ def _response_to_jsonable(resp: JsonRpcResponse) -> dict[str, Any]:
         out["error"] = err_obj
     out["id"] = resp.id
     return out
+
+
+def _json_default(value: Any) -> Any:
+    """``json.dumps`` fallback: encode wire data models via ``to_jsonable``."""
+    to_jsonable = getattr(value, "to_jsonable", None)
+    if callable(to_jsonable):
+        return to_jsonable()
+    msg = f"Object of type {type(value).__name__} is not JSON serializable"
+    raise TypeError(msg)
 
 
 def _jsontype(value: Any) -> str:

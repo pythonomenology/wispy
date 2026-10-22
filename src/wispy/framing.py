@@ -22,8 +22,18 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-__all__ = ["DecodeError", "FrameDecoder", "encode_frame"]
+__all__ = ["DEFAULT_MAX_CONTENT_LENGTH", "DecodeError", "FrameDecoder", "encode_frame"]
 
+
+# Largest payload :class:`FrameDecoder` accepts by default. A frame that
+# declares more is skipped (and reported) as its bytes arrive instead of
+# being buffered, so a hostile or buggy peer cannot exhaust memory.
+DEFAULT_MAX_CONTENT_LENGTH = 64 * 1024 * 1024
+
+# A legitimate header block is a few dozen bytes. Once this many bytes
+# are buffered without a ``\r\n\r\n`` the stream is garbage, and is
+# discarded rather than buffered forever.
+_MAX_HEADER_BYTES = 8 * 1024
 
 _HEADER_TERMINATOR = b"\r\n\r\n"
 _LINE_SEPARATOR = b"\r\n"
@@ -71,12 +81,21 @@ class FrameDecoder:
     decoder emits a :class:`DecodeError` describing the discarded bytes and
     advances past the offending region so subsequent valid frames are still
     decoded.
+
+    Memory is bounded: a frame whose ``Content-Length`` exceeds
+    ``max_content_length`` is reported immediately and its payload bytes
+    are dropped as they arrive, and more than ``_MAX_HEADER_BYTES`` of
+    input without a header terminator is discarded as garbage. Pass
+    ``max_content_length=None`` to disable the payload limit.
     """
 
-    __slots__ = ("_buffer",)
+    __slots__ = ("_buffer", "_max_content_length", "_skip")
 
-    def __init__(self) -> None:
+    def __init__(self, max_content_length: int | None = DEFAULT_MAX_CONTENT_LENGTH) -> None:
         self._buffer: bytearray = bytearray()
+        self._max_content_length = max_content_length
+        # Payload bytes of an oversized frame still to be dropped.
+        self._skip = 0
 
     def feed(self, chunk: bytes) -> Iterator[bytes | DecodeError]:
         """Append ``chunk`` to the internal buffer and yield available items.
@@ -105,8 +124,24 @@ class FrameDecoder:
         DecodeError) drops the corresponding bytes from the front of the
         buffer.
         """
+        if self._skip:
+            dropped = min(self._skip, len(self._buffer))
+            del self._buffer[:dropped]
+            self._skip -= dropped
+            if self._skip:
+                return None
+
         terminator_index = self._buffer.find(_HEADER_TERMINATOR)
         if terminator_index == -1:
+            if len(self._buffer) > _MAX_HEADER_BYTES:
+                # Keep the last few bytes: they may be the start of a
+                # terminator split across chunks.
+                discarded = len(self._buffer) - (len(_HEADER_TERMINATOR) - 1)
+                del self._buffer[:discarded]
+                return DecodeError(
+                    discarded=discarded,
+                    reason=f"no header terminator within {_MAX_HEADER_BYTES} bytes",
+                )
             # No complete header block yet. Wait for more bytes.
             return None
 
@@ -121,6 +156,16 @@ class FrameDecoder:
             return DecodeError(discarded=header_total, reason=parsed)
 
         content_length = parsed
+
+        if self._max_content_length is not None and content_length > self._max_content_length:
+            # Drop the header now and the payload as it arrives, rather
+            # than buffering it only to throw it away.
+            del self._buffer[:header_total]
+            self._skip = content_length
+            return DecodeError(
+                discarded=header_total + content_length,
+                reason=f"Content-Length {content_length} exceeds the maximum of {self._max_content_length} bytes",
+            )
 
         # Payload may not be fully buffered yet.
         if len(self._buffer) - header_total < content_length:

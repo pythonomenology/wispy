@@ -134,9 +134,15 @@ synthesized fields with literal ones.
 
 - The child's stdin is closed immediately. Your CLI does not need to
   read anything from stdin.
-- Each invocation has a 30-second wall-clock timeout. Exceeding it
-  kills the child and raises `EXECUTION_FAILED` with
-  `data.reason = "timeout"`.
+- Each invocation has a wall-clock timeout of 30 seconds, which an
+  entry can override with `timeout = <seconds>` (any positive number;
+  raise it for slow operations such as `environment/create`).
+  Exceeding it kills the child and raises `EXECUTION_FAILED` with
+  `data.reason = "timeout"`. `wsp --config` reads the entry's
+  `timeout` and waits that long (plus five seconds) for the response,
+  so a raised timeout is not cut off by `wsp`'s own 30-second limit.
+- If the server abandons a request (for example when draining after
+  stdin closes), the child is killed rather than left running.
 
 ### `import` — host a Python callable
 

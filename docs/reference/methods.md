@@ -129,8 +129,18 @@ Remove an environment.
 
 - `-31001` `ENVIRONMENT_NOT_FOUND` if the id is unknown.
 - `-31004` `EXECUTION_FAILED` if the id was known but deletion failed.
-  The index is left unchanged in that case, so the environment remains
-  listable.
+
+The built-in fallback removes the environment from its index before
+deleting its files. If deleting the files then fails, the call still
+succeeds, a warning naming the directory is written to stderr, and the
+leftover files are removed by a later `environment/create` or
+`environment/delete`. A delete waits for any `environment/get` or
+`environment/execute` already using that environment to finish.
+
+A command run by the fallback's `environment/execute` cannot delete the
+environment it runs in: that delete would wait for its own parent, so it
+fails at once with `EXECUTION_FAILED` and `data.reason = "env-in-use"`.
+The command can still `get` or `execute` in that environment.
 
 ### `environment/execute`
 

@@ -272,6 +272,20 @@ class LifecycleManager:
         self.state = ServerState.INITIALIZED
         self.capabilities = caps
 
+    def snapshot(self) -> LifecycleManager:
+        """Return a detached copy of the manager's current state.
+
+        The runtime admits a non-lifecycle message against a snapshot
+        taken when the message was read, so a task that first runs
+        after a later ``shutdown`` or ``exit`` still sees the state its
+        message arrived in. Such messages never advance the FSM, so
+        nothing written to the copy needs to reach the original.
+        """
+        copy = LifecycleManager()
+        copy.state = self.state
+        copy.capabilities = self.capabilities
+        return copy
+
     def on_shutdown_success(self) -> None:
         """Record a successful ``shutdown``."""
         self.state = ServerState.SHUTTING_DOWN

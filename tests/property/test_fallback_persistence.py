@@ -21,7 +21,7 @@ simulate a fresh CLI invocation:
    the persisted set of ``id`` values returned by ``environment/list``
    MUST always equal the multiset of ids in the shadow model.
 
-``subprocess.run``, ``venv.EnvBuilder.create``, and ``shutil.which``
+``subprocess.run``, ``wispy.cli.fallback._create_venv``, and ``shutil.which``
 are stubbed so each rule completes in milliseconds and never spawns a
 real interpreter. The on-disk state machinery (``index.json``, the
 file lock) is the system under test; the venv contents are not.
@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 # --------------------------------------------------------------------- #
 # Fakes for the subprocess / venv / PATH-resolution boundary.
 #
-# The fallback handler shells out to ``venv.EnvBuilder.create`` to
+# The fallback handler shells out to ``wispy.cli.fallback._create_venv`` to
 # materialize a venv on disk and to ``shutil.which`` to confirm a
 # ``pythonX.Y`` binary is on PATH. Real execution would be slow and
 # would couple the test to the host's installed interpreter set; we
@@ -86,8 +86,8 @@ def _fake_subprocess_run(argv: Any, **_kwargs: Any) -> subprocess.CompletedProce
     return subprocess.CompletedProcess(args=argv, returncode=0, stdout=b"", stderr=b"")
 
 
-def _fake_envbuilder_create(_self: Any, target_dir: Any) -> None:
-    """Stand in for :meth:`venv.EnvBuilder.create`.
+def _fake_create_venv(_interpreter: Any, target_dir: Any) -> None:
+    """Stand in for :func:`wispy.cli.fallback._create_venv`.
 
     The real method writes a full venv tree under ``target_dir``. Our
     stub merely creates the directory so :func:`shutil.rmtree` (called
@@ -312,7 +312,7 @@ def _patch_subprocess_and_venv(monkeypatch: pytest.MonkeyPatch) -> None:
     effect across every rule the state machine runs.
     """
     monkeypatch.setattr("wispy.cli.fallback.subprocess.run", _fake_subprocess_run)
-    monkeypatch.setattr("venv.EnvBuilder.create", _fake_envbuilder_create)
+    monkeypatch.setattr("wispy.cli.fallback._create_venv", _fake_create_venv)
     monkeypatch.setattr("wispy.cli.fallback.shutil.which", _fake_which)
 
 

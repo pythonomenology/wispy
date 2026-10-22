@@ -5,7 +5,7 @@ neither ``--tool`` nor ``--config`` supplied, exercising the
 in-process fallback path through every layer the user sees: argparse
 plumbing, the lifecycle FSM, the dispatcher, the
 :func:`make_fallback_registry` handlers, on-disk persistence in
-``index.json``, and a real ``venv.EnvBuilder`` materialization for
+``index.json``, and a real ``python -m venv`` materialization for
 the create round-trip.
 
 Each test isolates state via ``WISPY_STATE_DIR`` pointed at a fresh
@@ -23,7 +23,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import venv
 from pathlib import Path
 
 import pytest
@@ -52,9 +51,9 @@ _THIS_PY = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
 def _probe_venv_with_pip() -> tuple[bool, str]:
-    """Probe whether ``venv.EnvBuilder(with_pip=True)`` works here.
+    """Probe whether ``pythonX.Y -m venv`` (with pip) works here.
 
-    The fallback handler hard-codes ``with_pip=True`` so the
+    The fallback handler always bootstraps pip, so the
     round-trip test can only succeed on hosts where ``ensurepip``
     actually runs. Some interpreter installations (notably mise-
     managed Pythons that ship without a working ``ensurepip``
@@ -63,15 +62,19 @@ def _probe_venv_with_pip() -> tuple[bool, str]:
     test, so we skip it. The probe runs in a temp directory that is
     cleaned up regardless of outcome.
     """
-    if shutil.which(f"python{_THIS_PY}") is None:
+    interpreter = shutil.which(f"python{_THIS_PY}")
+    if interpreter is None:
         return False, f"python{_THIS_PY} not on PATH"
 
     tmpdir = Path(tempfile.mkdtemp(prefix="wispy-venv-probe-"))
     try:
-        try:
-            venv.EnvBuilder(with_pip=True).create(str(tmpdir / "v"))
-        except Exception as exc:  # noqa: BLE001 - any failure -> skip
-            return False, f"venv with_pip=True failed on this host: {exc}"
+        proc = subprocess.run(
+            [interpreter, "-m", "venv", str(tmpdir / "v")],
+            check=False,
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            return False, f"python -m venv failed on this host: {proc.stderr.decode('utf-8', errors='replace')}"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     return True, ""
@@ -168,7 +171,7 @@ def test_create_list_get_delete_round_trip(state_dir: Path) -> None:
     Walks the canonical lifecycle a user would: create an env, see
     it in ``list``, fetch its details via ``get``, delete it, then
     verify ``get`` returns environment-not-found and ``list`` is
-    empty again. A real ``venv.EnvBuilder`` materializes the venv on
+    empty again. A real ``python -m venv`` materializes the venv on
     disk, so this also covers the ``envs/<id>/`` filesystem layout.
     """
     # 1. create -> details JSON on stdout, exit 0.
@@ -181,7 +184,7 @@ def test_create_list_get_delete_round_trip(state_dir: Path) -> None:
             _THIS_PY,
         ],
         state_dir,
-        # ``venv.EnvBuilder(with_pip=True).create`` is the slow step:
+        # ``python -m venv`` is the slow step:
         # bootstrapping pip can take a few seconds on cold caches, so
         # give the subprocess a generous deadline.
         timeout=120.0,
@@ -196,7 +199,7 @@ def test_create_list_get_delete_round_trip(state_dir: Path) -> None:
 
     # The interpreter path returned from create MUST resolve to the
     # venv layout under ``state_dir/envs/<id>/``. Cross-check against
-    # the disk so we know ``venv.EnvBuilder`` actually ran.
+    # the disk so we know ``python -m venv`` actually ran.
     interpreter_path = Path(created["interpreter_path"])
     assert interpreter_path.is_absolute(), interpreter_path
     assert interpreter_path.exists(), interpreter_path

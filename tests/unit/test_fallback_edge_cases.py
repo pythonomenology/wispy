@@ -3,7 +3,7 @@
 These tests pin down the failure-mode contract of the built-in
 fallback handlers in :mod:`wispy.cli.fallback` -- the cases that are
 inconvenient to express in the rule-based property tests because they
-require a one-shot monkey-patch of ``venv.EnvBuilder.create``,
+require a one-shot monkey-patch of ``wispy.cli.fallback._create_venv``,
 ``shutil.rmtree``, or ``subprocess.run`` and exercise paths the
 state machine model does not enumerate.
 
@@ -18,6 +18,7 @@ behaviour under test is the handler-level rule, not param parsing
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -54,10 +55,10 @@ def _which_python(name: str) -> str | None:
     return None
 
 
-def _make_dir_create(_self: Any, target: str) -> None:
-    """Stand-in for ``venv.EnvBuilder.create`` that just makes the dir.
+def _make_dir_create(_interpreter: Any, target: Any) -> None:
+    """Stand-in for ``wispy.cli.fallback._create_venv`` that just makes the dir.
 
-    A real ``venv.EnvBuilder.create`` is too slow for unit tests and
+    A real venv creation is too slow for unit tests and
     pulls in a real interpreter. The fallback only cares that the
     target directory exists after a successful create; this stub
     satisfies that contract without invoking ``ensurepip``.
@@ -106,13 +107,13 @@ def test_create_failure_removes_partial_dir_and_does_not_update_index(
 ) -> None:
     """A ``venv`` failure cleans up the partial dir and skips the index.
 
-    When ``venv.EnvBuilder.create`` raises during
+    When ``wispy.cli.fallback._create_venv`` raises during
     ``environment/create``, the handler must remove the partial
     ``envs/<id>/`` directory and leave the persisted index unchanged
     so a retry behaves like a fresh request.
     """
 
-    def _failing_create(_self: Any, target: str) -> None:
+    def _failing_create(_interpreter: Any, target: Any) -> None:
         # Simulate a venv that started laying down files before
         # blowing up: the directory exists when the exception is
         # raised, exercising the cleanup branch.
@@ -120,7 +121,7 @@ def test_create_failure_removes_partial_dir_and_does_not_update_index(
         msg = "simulated venv failure"
         raise RuntimeError(msg)
 
-    monkeypatch.setattr("venv.EnvBuilder.create", _failing_create)
+    monkeypatch.setattr("wispy.cli.fallback._create_venv", _failing_create)
 
     with pytest.raises(WspError) as excinfo:
         _call(
@@ -146,20 +147,21 @@ def test_create_failure_removes_partial_dir_and_does_not_update_index(
 # ---------------------------------------------------------------------------
 
 
-def test_delete_rmtree_failure_raises_execution_failed_and_keeps_env(
+def test_delete_rmtree_failure_unlists_env_and_next_create_sweeps_it(
     fallback: Any,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A ``shutil.rmtree`` OSError surfaces as ``execution-failed``.
+    """A ``shutil.rmtree`` OSError still deletes the env.
 
-    When the env exists in the index and on disk
-    but the rmtree fails, the handler must raise
-    ``WspError(EXECUTION_FAILED, ...)`` and leave the index unchanged
-    so the env is still listable / gettable afterwards.
+    The index is rewritten before the directory is removed, so a
+    removal that fails part-way cannot leave a listed env whose venv
+    is half gone (``tla/FallbackStore`` trace ``IndexedComplete``).
+    The leftover directory is unlisted and the next create removes it.
     """
     # Create an env first using a stub create so rmtree has something
     # to operate on.
-    monkeypatch.setattr("venv.EnvBuilder.create", _make_dir_create)
+    monkeypatch.setattr("wispy.cli.fallback._create_venv", _make_dir_create)
     created = _call(
         fallback,
         "environment/create",
@@ -173,20 +175,26 @@ def test_delete_rmtree_failure_raises_execution_failed_and_keeps_env(
         msg = "simulated rmtree failure"
         raise OSError(msg)
 
+    real_rmtree = shutil.rmtree
     monkeypatch.setattr("wispy.cli.fallback.shutil.rmtree", _failing_rmtree)
 
+    ack = _call(fallback, "environment/delete", DeleteEnvironmentParams(id=env_id))
+    assert ack == {"id": env_id}
+    assert _call(fallback, "environment/list", None) == []
     with pytest.raises(WspError) as excinfo:
-        _call(
-            fallback,
-            "environment/delete",
-            DeleteEnvironmentParams(id=env_id),
-        )
-    assert excinfo.value.code == int(WspErrorCode.EXECUTION_FAILED)
+        _call(fallback, "environment/get", GetEnvironmentParams(id=env_id))
+    assert excinfo.value.code == int(WspErrorCode.ENVIRONMENT_NOT_FOUND)
 
-    # The env must still be present in the index.
-    listing = _call(fallback, "environment/list", None)
-    assert len(listing) == 1
-    assert listing[0]["id"] == env_id
+    state = FallbackState(tmp_path / "state")
+    assert (state.envs_dir / env_id).is_dir()
+
+    monkeypatch.setattr("wispy.cli.fallback.shutil.rmtree", real_rmtree)
+    created = _call(
+        fallback,
+        "environment/create",
+        CreateEnvironmentParams(name="bar", python_version="3.12"),
+    )
+    assert [p.name for p in state.envs_dir.iterdir()] == [created["id"]]
 
 
 def test_delete_unknown_id_raises_environment_not_found(fallback: Any) -> None:
@@ -216,7 +224,7 @@ def test_execute_spawn_failure_raises_execution_failed(
     (executable missing, cwd missing, etc.) the handler must raise
     ``WspError(EXECUTION_FAILED, ...)``.
     """
-    monkeypatch.setattr("venv.EnvBuilder.create", _make_dir_create)
+    monkeypatch.setattr("wispy.cli.fallback._create_venv", _make_dir_create)
     created = _call(
         fallback,
         "environment/create",
@@ -297,7 +305,7 @@ def test_get_returns_full_details_with_extra_always_present(
     ``subprocess.run`` so the pip-list invocation does not actually
     spawn anything.
     """
-    monkeypatch.setattr("venv.EnvBuilder.create", _make_dir_create)
+    monkeypatch.setattr("wispy.cli.fallback._create_venv", _make_dir_create)
     created = _call(
         fallback,
         "environment/create",
@@ -351,7 +359,7 @@ def test_list_ordering_is_stable_and_ascending_by_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Consecutive ``environment/list`` calls yield equal, sorted output."""
-    monkeypatch.setattr("venv.EnvBuilder.create", _make_dir_create)
+    monkeypatch.setattr("wispy.cli.fallback._create_venv", _make_dir_create)
 
     # Create several envs; ids are uuid-prefixed so insertion order is
     # not the same as id order in general.
